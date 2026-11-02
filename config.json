@@ -1,0 +1,26 @@
+{
+  "icon_size": 48,
+  "max_icon_size": 96,
+  "spread": 3.0,
+  "spacing": 4,
+  "edge_padding": 10,
+  "icon_theme": "oxygen",
+  "label_font": "Sans Bold 10.5",
+  "trash": true,
+  "categories": [
+    "Internet",
+    "Office",
+    "Graphics",
+    "Multimedia",
+    "Development",
+    "Games",
+    "Education",
+    "Science",
+    "Utilities",
+    "System",
+    "Settings",
+    "Other"
+  ],
+  "sounds": true,
+  "volume": 0.5
+}
