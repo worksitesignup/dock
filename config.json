@@ -22,5 +22,10 @@
     "Other"
   ],
   "sounds": true,
-  "volume": 0.5
+  "volume": 0.5,
+  "folders": [
+    "~/Downloads",
+    "~/Documents"
+  ],
+  "mounts": true
 }

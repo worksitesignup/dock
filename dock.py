@@ -53,6 +53,8 @@ DEFAULTS = {
     "icon_theme": "oxygen",   # glossy theme suits Aqua; "" = system theme
     "label_font": "Sans Bold 10.5",
     "trash": True,
+    "folders": ["~/Downloads", "~/Documents"],   # stacks next to the trash
+    "mounts": True,           # show removable drives / mounted volumes
     "sounds": True,           # procedural sound effects
     "volume": 0.5,            # 0..1
     "categories": ["Internet", "Office", "Graphics", "Multimedia", "Development", "Games",
@@ -203,19 +205,35 @@ class AppItem(Item):
         dock.activate_app(self)
 
 
-class TrashItem(Item):
-    kind = "trash"
-    label = "Trash"
-
-    def __init__(self):
-        super().__init__()
-        self.full = False
-
-    def activate(self, dock):
+def folder_places(paths):
+    out = []
+    for p in paths:
+        path = os.path.expanduser(p)
+        if not os.path.isdir(path):
+            continue
+        f = Gio.File.new_for_path(path)
         try:
-            Gio.AppInfo.launch_default_for_uri("trash:///", None)
-        except GLib.Error as e:
-            print("trash:", e, file=sys.stderr)
+            inf = f.query_info("standard::display-name,standard::icon", Gio.FileQueryInfoFlags.NONE, None)
+            label, gicon = inf.get_display_name(), inf.get_icon()
+        except GLib.Error:
+            label, gicon = os.path.basename(path.rstrip("/")) or path, None
+        out.append(PlaceItem("dir:" + path, label, f, gicon))
+    return out
+
+
+def mount_places(monitor):
+    out = []
+    for m in monitor.get_mounts():
+        if m.is_shadowed():
+            continue
+        root = m.get_root()
+        path = root.get_path() or ""
+        # Skip system mounts; keep removable media, network shares, etc.
+        if path and not (path.startswith("/run/media/") or path.startswith("/media/")
+                         or path.startswith("/mnt/")) and root.is_native():
+            continue
+        out.append(PlaceItem("mnt:" + root.get_uri(), m.get_name(), root, m.get_icon(), m))
+    return out
 
 
 class Separator(Item):
@@ -294,6 +312,127 @@ class CategoryItem(Item):
         dock.bubble.toggle(self)
 
 
+MAX_STACK = 30      # files per page of a folder stack (newest first); scroll for more
+MAX_FILES = 2000
+
+
+class FileEntry:
+    """One file inside a folder stack; quacks like an AppItem for the blob."""
+    running = False
+    names = frozenset()
+
+    def __init__(self, gfile, label, gicon):
+        self.gfile = gfile
+        self.id = gfile.get_uri()
+        self.label = label
+        self.gicon = gicon
+
+    def open(self):
+        try:
+            Gio.AppInfo.launch_default_for_uri(self.gfile.get_uri(), None)
+        except GLib.Error as e:
+            print("dock: open failed:", e, file=sys.stderr)
+
+
+class PlaceItem(CategoryItem):
+    """A folder or mounted volume; its blob shows the folder's contents."""
+
+    def __init__(self, key, label, gfile, gicon, mount=None):
+        super().__init__(label, ["folder"], [])
+        self.key = key
+        self.gfile = gfile
+        self.gicon = gicon
+        self.mount = mount
+        self._entries = {}
+        self.files = []
+        self.page = 0
+        self.open_entry = self._open_entry()
+        self.apps = [self.open_entry]
+
+    @property
+    def pages(self):
+        return max(1, -(-len(self.files) // MAX_STACK))
+
+    def set_page(self, page):
+        """Show one page of files (plus the Open entry); True if it changed."""
+        page = max(0, min(page, self.pages - 1))
+        apps = self.files[page * MAX_STACK:(page + 1) * MAX_STACK] + [self.open_entry]
+        changed = page != self.page or [a.id for a in apps] != [a.id for a in self.apps]
+        self.page, self.apps = page, apps
+        return changed
+
+    def _open_entry(self):
+        return FileEntry(self.gfile, "Open " + self.label, self.gicon or Gio.ThemedIcon.new("folder"))
+
+    def refresh(self):
+        """Re-read the folder; reuse entries so loaded icons carry over."""
+        files = []
+        try:
+            en = self.gfile.enumerate_children(
+                "standard::name,standard::display-name,standard::icon,standard::is-hidden,"
+                "time::modified,time::created", Gio.FileQueryInfoFlags.NONE, None)
+            for inf in en:
+                if inf.get_is_hidden() or inf.get_name().startswith("."):
+                    continue
+                t = (inf.get_attribute_uint64("time::created")
+                     or inf.get_attribute_uint64("time::modified"))
+                files.append((t, inf))
+            en.close(None)
+        except GLib.Error as e:
+            print("dock: can't read", self.label, e.message, file=sys.stderr)
+        files.sort(key=lambda f: -f[0])
+        apps, keep = [], {}
+        for _t, inf in files[:MAX_FILES]:
+            child = self.gfile.get_child(inf.get_name())
+            uri = child.get_uri()
+            e = self._entries.get(uri) or FileEntry(child, inf.get_display_name(), inf.get_icon())
+            keep[uri] = e
+            apps.append(e)
+        self._entries = keep
+        self.files = apps
+        return self.set_page(self.page)
+
+    def eject(self, dock):
+        m = self.mount
+        if m is None:
+            return
+        op = Gio.MountOperation()
+        flags = Gio.MountUnmountFlags.NONE
+
+        def done(res, finish):
+            try:
+                finish(res)
+            except GLib.Error as e:
+                print("dock: eject failed:", e.message, file=sys.stderr)
+        if m.can_eject():
+            m.eject_with_operation(flags, op, None, lambda _s, r: done(r, m.eject_with_operation_finish))
+        elif m.can_unmount():
+            m.unmount_with_operation(flags, op, None, lambda _s, r: done(r, m.unmount_with_operation_finish))
+
+
+TRASH_DIR = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                         "Trash", "files")
+
+
+class TrashItem(PlaceItem):
+    # Read the XDG trash folder directly: trash:/// needs gvfs, which KDE lacks.
+    def __init__(self):
+        super().__init__("trash", "Trash", Gio.File.new_for_path(TRASH_DIR),
+                         Gio.ThemedIcon.new("user-trash"))
+        self.full = False
+
+    def _open_entry(self):
+        return FileEntry(Gio.File.new_for_uri("trash:///"), "Open Trash", Gio.ThemedIcon.new("user-trash"))
+
+    def is_full(self):
+        try:
+            return any(True for _ in os.scandir(TRASH_DIR))
+        except OSError:
+            return False
+
+
+
+
 # --------------------------------------------------------------------------- dock
 
 class Dock(Gtk.Window):
@@ -333,6 +472,9 @@ class Dock(Gtk.Window):
         self.font = Pango.FontDescription.from_string(cfg["label_font"])
 
         self.items = []
+        self.volume_monitor = Gio.VolumeMonitor.get()
+        for sig in ("mount-added", "mount-removed", "mount-changed"):
+            self.volume_monitor.connect(sig, lambda *_: self._on_apps_changed(None))
         self._build_items()
         self._fit_height()
         self.last_bbox = None
@@ -342,7 +484,16 @@ class Dock(Gtk.Window):
         self.area.set_size_request(-1, self.height)
         self.area.add_events(Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK
                              | Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.BUTTON_PRESS_MASK
-                             | Gdk.EventMask.BUTTON_RELEASE_MASK)
+                             | Gdk.EventMask.BUTTON_RELEASE_MASK | Gdk.EventMask.SCROLL_MASK
+                             | Gdk.EventMask.SMOOTH_SCROLL_MASK)
+        self.scroll_acc = 0.0
+        self.area.connect("scroll-event", self.on_scroll)
+        # Drop folders from the file manager onto the dock to add them.
+        self.area.drag_dest_set(Gtk.DestDefaults.ALL, [], Gdk.DragAction.COPY | Gdk.DragAction.LINK)
+        self.area.drag_dest_add_uri_targets()
+        self.area.connect("drag-data-received", self.on_drop)
+        self.drag = None           # (item, x, y) while a folder is dragged off the dock
+        self.press_xy = None
         self.area.connect("draw", self.on_draw)
         self.area.connect("motion-notify-event", self.on_motion)
         self.area.connect("enter-notify-event", self.on_motion)
@@ -372,7 +523,7 @@ class Dock(Gtk.Window):
     def _build_items(self):
         """(Re)build the dock items, reusing existing objects so open blobs,
         loaded icons, springs and running state carry over."""
-        old_cats = {i.label: i for i in self.items if isinstance(i, CategoryItem)}
+        old_cats = {i.label: i for i in self.items if type(i) is CategoryItem}
         old_apps = {a.id: a for c in old_cats.values() for a in c.apps}
         old_trash = next((i for i in self.items if isinstance(i, TrashItem)), None)
         groups = categorize_apps()
@@ -395,16 +546,25 @@ class Dock(Gtk.Window):
                 cat = CategoryItem(name, CATEGORIES[name][0], apps)
             cat.apps = apps
             items.append(cat)
+        old_places = {i.key: i for i in self.items if isinstance(i, PlaceItem)}
+        places = folder_places(self.cfg["folders"])
+        if self.cfg["mounts"]:
+            places += mount_places(self.volume_monitor)
+        right = [old_places.get(p.key, p) for p in places]
+        for p, fresh in zip(right, places):
+            p.label, p.mount = fresh.label, fresh.mount
         if self.cfg["trash"]:
+            right.append(old_trash or TrashItem())
+        if right:
             if items and items[-1].kind != "sep":
                 items.append(Separator())
-            items.append(old_trash or TrashItem())
+            items += right
         self.items = items
 
     def all_apps(self):
         seen = {}
         for it in self.items:
-            if isinstance(it, CategoryItem):
+            if type(it) is CategoryItem:
                 for a in it.apps:
                     seen.setdefault(a.id, a)
         return sorted(seen.values(), key=lambda a: a.label.lower())
@@ -427,8 +587,8 @@ class Dock(Gtk.Window):
 
     def _fit_height(self):
         """The blob lives in the same surface, so reserve room for the biggest one."""
-        biggest = max((blob_radius(len(i.apps)) for i in self.items if isinstance(i, CategoryItem)),
-                      default=0)
+        biggest = max((blob_radius(MAX_STACK + 1 if isinstance(i, PlaceItem) else len(i.apps))
+                       for i in self.items if isinstance(i, CategoryItem)), default=0)
         gap = self.max - self.base + 26
         h = max(self.height, self.shelf_h + round(gap * 1.25 + biggest * 2.7) + BLOB_LABEL)
         # The search blob holds every app; size it to fit under the search bar.
@@ -455,7 +615,7 @@ class Dock(Gtk.Window):
     def _rebuild_apps(self):
         self.rebuild_id = None
         self._build_items()
-        n = sum(len(i.apps) for i in self.items if isinstance(i, CategoryItem))
+        n = sum(len(i.apps) for i in self.items if type(i) is CategoryItem)
         print(f"dock: app list changed, {n} apps", file=sys.stderr, flush=True)
         if self.get_realized():
             self._load_icons(only_missing=True)
@@ -501,11 +661,13 @@ class Dock(Gtk.Window):
         for it in self.items:
             if only_missing and (hasattr(it, "icon") or hasattr(it, "icon_empty")):
                 continue
-            if isinstance(it, CategoryItem):
-                it.icon = Icon(theme, None, it.icon_names, scale)
-            elif isinstance(it, TrashItem):
+            if isinstance(it, TrashItem):
                 it.icon_empty = Icon(theme, None, ["user-trash"], scale)
                 it.icon_full = Icon(theme, None, ["user-trash-full", "user-trash"], scale)
+            elif isinstance(it, PlaceItem):
+                it.icon = Icon(theme, it.gicon, ["folder", "drive-removable-media"], scale)
+            elif isinstance(it, CategoryItem):
+                it.icon = Icon(theme, None, it.icon_names, scale)
 
     # ---- state polling: running apps + trash ------------------------------
 
@@ -527,7 +689,9 @@ class Dock(Gtk.Window):
             procs.add(comm.lower())
         changed = False
         for it in self.items:
-            if isinstance(it, CategoryItem):
+            if isinstance(it, PlaceItem) and not isinstance(it, TrashItem):
+                continue
+            if type(it) is CategoryItem:
                 for app in it.apps:
                     app.running = any(n.lower() in procs or n.lower()[:15] in procs
                                       for n in app.names)
@@ -535,12 +699,7 @@ class Dock(Gtk.Window):
                 changed |= running != it.running
                 it.running = running
             elif isinstance(it, TrashItem):
-                try:
-                    inf = Gio.File.new_for_uri("trash:///").query_info(
-                        "trash::item-count", Gio.FileQueryInfoFlags.NONE, None)
-                    full = inf.get_attribute_uint32("trash::item-count") > 0
-                except GLib.Error:
-                    full = False
+                full = it.is_full()
                 changed |= full != it.full
                 it.full = full
         if changed:
@@ -565,13 +724,16 @@ class Dock(Gtk.Window):
         self.wake()
 
     def category_of(self, app):
-        return next((c for c in self.items if isinstance(c, CategoryItem) and app in c.apps), None)
+        return next((c for c in self.items if type(c) is CategoryItem and app in c.apps), None)
 
     def activate_app(self, item):
         """Focus an existing window via KWin; KWin calls back NoWindow if none."""
         self.sfx.play("launch")
         self.search.close(launched=True)
         self.bubble.close(quiet=True)
+        if isinstance(item, FileEntry):
+            item.open()
+            return
         if not item.running or not kwin_activate(item):
             self.launch(item)
 
@@ -666,6 +828,11 @@ class Dock(Gtk.Window):
 
     def on_motion(self, _w, ev):
         self.hover = True
+        if self.drag is not None and not ev.state & Gdk.ModifierType.BUTTON1_MASK:
+            self._drag_end(ev.x, ev.y)          # missed the release
+        if ev.state & Gdk.ModifierType.BUTTON1_MASK and self._drag_motion(ev.x, ev.y):
+            self.mouse_x = ev.x
+            return False
         if self.bubble.contains(ev.x, ev.y):
             # Inside the blob the dock holds still, so the icons don't slide away.
             self.bubble.pointer(ev.x, ev.y)
@@ -686,6 +853,10 @@ class Dock(Gtk.Window):
         return False
 
     def on_leave(self, _w, ev):
+        if self.drag is not None:
+            # Left the surface mid-drag: treat it as pulled off the dock.
+            self._drag_end(ev.x, min(ev.y, 0))
+            self.pressed = None
         if ev.detail != Gdk.NotifyType.INFERIOR:
             self.hover = False
             self.pressed = None
@@ -694,10 +865,131 @@ class Dock(Gtk.Window):
             self.wake()
         return False
 
+    # ---- folders: scroll, drop in, drag out ---------------------------------
+
+    def on_scroll(self, _w, ev):
+        if not self.bubble.contains(ev.x, ev.y):
+            return False
+        if ev.direction == Gdk.ScrollDirection.SMOOTH:
+            ok, _dx, dy = ev.get_scroll_deltas()
+            self.scroll_acc += dy
+        else:
+            self.scroll_acc += {Gdk.ScrollDirection.DOWN: 1, Gdk.ScrollDirection.RIGHT: 1,
+                                Gdk.ScrollDirection.UP: -1, Gdk.ScrollDirection.LEFT: -1}.get(ev.direction, 0)
+        if abs(self.scroll_acc) >= 1:
+            self.bubble.scroll(1 if self.scroll_acc > 0 else -1)
+            self.scroll_acc = 0.0
+        return True
+
+    def save_folders(self):
+        home = os.path.expanduser("~")
+        self.cfg["folders"] = ["~" + p[len(home):] if p == home or p.startswith(home + "/") else p
+                               for p in self.cfg["folders"]]
+        path = os.path.join(HERE, "config.json")
+        try:
+            with open(path) as f:
+                raw = json.load(f)
+        except (OSError, ValueError):
+            raw = {}
+        raw["folders"] = self.cfg["folders"]
+        with open(path, "w") as f:
+            json.dump(raw, f, indent=2)
+        self._rebuild_apps()
+
+    def _folder_slot(self, x):
+        """Index in cfg["folders"] a drop at x lands on."""
+        dirs = [i for i in self.items if isinstance(i, PlaceItem) and i.key.startswith("dir:")]
+        return sum(1 for i in dirs if i.x + i.size / 2 < x)
+
+    def on_drop(self, _w, ctx, x, _y, data, _info, time_):
+        known = {os.path.realpath(os.path.expanduser(p)) for p in self.cfg["folders"]}
+        at = self._folder_slot(x)
+        added = 0
+        for uri in data.get_uris() or []:
+            path = Gio.File.new_for_uri(uri).get_path()
+            if not path or not os.path.isdir(path) or os.path.realpath(path) in known:
+                continue
+            known.add(os.path.realpath(path))
+            self.cfg["folders"].insert(at + added, path)
+            added += 1
+        if added:
+            self.sfx.pop(0)
+            self.save_folders()
+
+    def _drag_motion(self, x, y):
+        """Pull a docked folder up and away; returns True while dragging."""
+        it = self.pressed
+        if self.drag is None:
+            if not (isinstance(it, PlaceItem) and it.key.startswith("dir:")) or self.press_xy is None:
+                return False
+            if math.hypot(x - self.press_xy[0], y - self.press_xy[1]) < 8:
+                return False
+            self.bubble.close(quiet=True)
+            self.drag = it
+        self.drag_xy = (x, y)
+        self.dirty = True
+        self.wake()
+        return True
+
+    def _on_ball_folder(self, x, y):
+        b = self.bubble
+        it = b.open_item
+        if not (isinstance(it, PlaceItem) and it.key.startswith("dir:")) or b.geom is None:
+            return False
+        cx, cy, size = b.cat_target()
+        return abs(x - cx) <= size / 2 and abs(y - cy) <= size / 2
+
+    def drag_off(self, y):
+        """Released far enough above the shelf to leave the dock."""
+        return y < self.area.get_allocated_height() - self.shelf_h - 50
+
+    def _drag_end(self, x, y):
+        it, self.drag = self.drag, None
+        self.press_xy = None
+        if it is None:
+            return
+        path = it.key[len("dir:"):]
+        if self.drag_off(y):
+            self.cfg["folders"] = [p for p in self.cfg["folders"]
+                                   if os.path.realpath(os.path.expanduser(p)) != os.path.realpath(path)]
+            self.sfx.unpop(0)
+        else:                       # dropped back on the shelf: reorder
+            folders = [p for p in self.cfg["folders"]
+                       if os.path.realpath(os.path.expanduser(p)) != os.path.realpath(path)]
+            others = [i for i in self.items if isinstance(i, PlaceItem) and i.key.startswith("dir:")
+                      and i is not it]
+            at = sum(1 for i in others if i.x + i.size / 2 < x)
+            folders.insert(at, path)
+            if folders == [os.path.expanduser(p) for p in self.cfg["folders"]] or \
+                    folders == self.cfg["folders"]:
+                self.dirty = True
+                self.wake()
+                return
+            self.cfg["folders"] = folders
+        self.save_folders()
+
+    def draw_drag(self, cr, h):
+        it = self.drag
+        x, y = self.drag_xy
+        size = self.base * 1.1
+        cr.save()
+        if self.drag_off(y):
+            cr.push_group()
+            self.draw_icon_at(cr, it, x - size / 2, y - size / 2, size, self.bounce_h)
+            cr.pop_group_to_source()
+            cr.paint_with_alpha(0.55)          # about to disappear
+        else:
+            self.draw_icon_at(cr, it, x - size / 2, y - size / 2, size, self.bounce_h)
+        cr.restore()
+
     def on_press(self, _w, ev):
         if ev.button == 1:
-            if self.bubble.contains(ev.x, ev.y):
-                self.bubble.press(ev.x, ev.y)
+            self.press_xy = (ev.x, ev.y)
+            b = self.bubble
+            if b.contains(ev.x, ev.y) and self._on_ball_folder(ev.x, ev.y):
+                self.pressed = b.open_item       # grab the folder from the ball's centre
+            elif b.contains(ev.x, ev.y):
+                b.press(ev.x, ev.y)
             else:
                 self.pressed = self.item_at(ev.x, ev.y, self.area.get_allocated_height())
             self.dirty = True
@@ -705,7 +997,17 @@ class Dock(Gtk.Window):
         return True
 
     def on_release(self, _w, ev):
+        if ev.button == 3:      # right-click a drive to eject it
+            it = self.item_at(ev.x, ev.y, self.area.get_allocated_height())
+            if isinstance(it, PlaceItem):
+                it.eject(self)
+            return True
         if ev.button != 1:
+            return True
+        self.press_xy = None
+        if self.drag is not None:
+            self._drag_end(ev.x, ev.y)
+            self.pressed = None
             return True
         if self.bubble.pressed is not None:
             self.bubble.release(ev.x, ev.y)
@@ -759,6 +1061,11 @@ class Dock(Gtk.Window):
 
     def _queue_damage(self):
         """Redraw only the area the dock and blob occupy (old and new)."""
+        if self.drag is not None or getattr(self, "_was_drag", False):
+            self._was_drag = self.drag is not None
+            self.last_bbox = None
+            self.area.queue_draw()
+            return
         cur = self._content_bbox()
         prev = self.last_bbox or cur
         x0, y0 = min(cur[0], prev[0]), min(cur[1], prev[1])
@@ -771,6 +1078,8 @@ class Dock(Gtk.Window):
     def _update_input_region(self, height):
         sx, sy, sw, sh = self.shelf_rect(height)
         rects = [(sx, sy, sw, sh)]
+        if self.drag is not None:       # keep the pointer while a folder is dragged
+            rects.append((0, 0, self.area.get_allocated_width(), height))
         for it in self.items:
             if it.kind != "sep":
                 rects.append((it.x, height - self.pad_bottom - it.size, it.size, it.size))
@@ -798,7 +1107,8 @@ class Dock(Gtk.Window):
         self._update_input_region(h)
 
         now = time.monotonic()
-        hovered = self.item_at(self.mouse_x, h - 1, h) if self.hover and self.mouse_x is not None else None
+        hovered = self.item_at(self.mouse_x, h - 1, h) if self.hover and self.mouse_x is not None \
+            and self.drag is None else None
         if hovered is not self.hovered:
             self.hovered = hovered
             self.bubble.on_dock_hover(hovered)
@@ -813,6 +1123,11 @@ class Dock(Gtk.Window):
             lift = self.bounce_offset(it, now)
             if it.kind == "cat" and it.pull.x > 0.001:
                 riding.append((it, lift))
+            elif it is self.drag:
+                cr.push_group()
+                self.draw_icon(cr, it, h, lift)
+                cr.pop_group_to_source()
+                cr.paint_with_alpha(0.3)
             else:
                 self.draw_icon(cr, it, h, lift)
             if it.kind == "cat" and it.running:
@@ -827,6 +1142,9 @@ class Dock(Gtk.Window):
             size = lerp(it.size, tsize, k)
             self.draw_icon_at(cr, it, lerp(sx, tx, k) - size / 2, lerp(sy, ty, k) - size / 2, size, 0.0)
         self.bubble.draw_contents(cr, w)
+        if self.drag is not None:
+            self.draw_drag(cr, h)
+            return
         if hovered is not None and self.mag > 0.5 and hovered is not self.bubble.open_item:
             self.draw_label(cr, hovered, w, h, self.bounce_offset(hovered, now))
 
@@ -916,7 +1234,7 @@ class Dock(Gtk.Window):
 
     def draw_icon_at(self, cr, it, x, y, size, lift):
         icon = getattr(it, "icon", None)
-        if it.kind == "trash":
+        if isinstance(it, TrashItem):
             icon = it.icon_full if it.full else it.icon_empty
         if icon is None or not icon.levels:
             return
@@ -1045,6 +1363,7 @@ BLOB_PAD = 14         # rim padding around the outermost icons
 BLOB_LABEL = 34       # headroom above the ball for the top row's labels
 CAT_IN_BALL = 60      # category icon size at the centre of the ball
 WAVE_RX, WAVE_RY = 74.0, 62.0   # phase-1 wave crest (half width, height)
+PAGE_SLIDE_T = 0.5    # seconds for a folder page to slide in
 REST_MS = 260         # pointer still this long over a category -> phase 2
 
 
@@ -1179,6 +1498,7 @@ class Blob:
         self.slots = []
         self.old_slots = []
         self.xfade = 1.0
+        self.slide = 0                  # +1/-1 while a folder page slides in
         self.R_target = 0.0
         self.s = Spring()               # emergence 0..1
         self.p = Spring()               # phase: 0 wave .. 1 ball
@@ -1269,6 +1589,10 @@ class Blob:
 
     def show_for(self, item):
         self._cancel("hide_id")
+        if isinstance(item, PlaceItem):
+            if item is not self.open_item:
+                item.page = 0
+            item.refresh()
         scale = self.dock.get_scale_factor()
         for app in item.apps:
             if not hasattr(app, "icon"):
@@ -1501,7 +1825,9 @@ class Blob:
             self.bx.step(cx, dt, 260, 30)
         self.fx.step(cx, dt, 320, 34)
         if self.xfade < 1.0:
-            self.xfade = min(1.0, self.xfade + dt / 0.18)
+            self.xfade = min(1.0, self.xfade + dt / (PAGE_SLIDE_T if self.slide else 0.18))
+            if self.xfade >= 1.0:
+                self.slide = 0
         # Stretch tall while inflating, squash while sliding; then jiggle back.
         stretch = max(-0.2, min(0.2, self.p.v * 0.05 - abs(self.bx.v) * 0.00025))
         self.wob.step(stretch, dt, 260, 9)
@@ -1714,8 +2040,10 @@ class Blob:
             mag, mag_r = APP_MAG, APP_MAG_R
         m = self.amag.x
         out = []
+        off = self.slide_offset(False) if st is None else 0.0
         for app, dx, dy in self.slots:
             ax, ay = self._slot_xy(dx, dy)
+            ay += off
             size = base
             if st is not None:
                 # matches full size, the rest small; the selection a bit bigger
@@ -1767,6 +2095,32 @@ class Blob:
             if self.dock.hovered is not self.open_item:
                 self.schedule_hide()
 
+    def slide_offset(self, old):
+        """Vertical shift of the outgoing (old) or incoming page while sliding."""
+        if not self.slide or self.geom is None:
+            return 0.0
+        t = self.xfade
+        t = t * t * (3 - 2 * t)                  # smoothstep
+        dist = self.geom["ry"] * 0.9
+        return -self.slide * dist * t if old else self.slide * dist * (1 - t)
+
+    def scroll(self, d):
+        """Page through a folder stack that holds more than one bubble's worth."""
+        item = self.open_item
+        if self.xfade < 0.85:                    # let the current slide finish
+            return
+        if self.search is not None or not isinstance(item, PlaceItem) or not item.set_page(item.page + d):
+            return
+        self.old_slots, self.xfade, self.slide = self.slots, 0.0, d
+        self.slots = [(a, x, y) for a, (x, y) in zip(item.apps, ring_points(len(item.apps)))]
+        self.R_target = blob_radius(len(item.apps))
+        self.hover_app = self.pressed = None
+        for a in item.apps:
+            app_icon(self.dock, a)
+        self.dock.sfx.hover(item.page)
+        self.dock.dirty = True
+        self.dock.wake()
+
     def press(self, x, y):
         self.pressed = self.app_at(x, y)
 
@@ -1816,10 +2170,20 @@ class Blob:
         rv = self.reveal()
         label = None
         if rv > 0.0:
+            cr.save()
+            if self.slide:                       # pages slide inside the ball, not past it
+                cr.save()
+                cr.translate(g["bx"], g["by"])
+                cr.scale(max(1.0, g["rx"] - 4), max(1.0, g["ry"] - 4))
+                cr.arc(0, 0, 1, 0, 2 * math.pi)
+                cr.restore()
+                cr.clip()
             if self.old_slots and self.xfade < 1.0:
                 cr.push_group()
+                off = self.slide_offset(True)
                 for app, dx, dy in self.old_slots:
                     ax, ay = self._slot_xy(dx, dy)
+                    ay += off
                     self._draw_icon(cr, app, ax - BLOB_ICON / 2, ay - BLOB_ICON / 2, BLOB_ICON, False)
                 cr.pop_group_to_source()
                 cr.paint_with_alpha(rv * (1 - self.xfade))
@@ -1838,7 +2202,15 @@ class Blob:
                 if app is self.hover_app:
                     label = (app.label, ax, ay - size / 2 - 4)
             cr.pop_group_to_source()
-            cr.paint_with_alpha(rv * self.xfade)
+            cr.paint_with_alpha(rv * (1.0 if self.slide else self.xfade))
+            cr.restore()
+        it = self.open_item
+        if isinstance(it, PlaceItem) and it.pages > 1 and rv > 0.5:
+            n = len(it.files)
+            a, b = it.page * MAX_STACK + 1, min(n, (it.page + 1) * MAX_STACK)
+            arrows = ("▲ " if it.page > 0 else "") + f"{a}–{b} of {n}" + (" ▼" if it.page < it.pages - 1 else "")
+            draw_label_pill(cr, self.small_font(), arrows, g["bx"], g["by"] + g["ry"] - 4,
+                            width, min(1.0, (rv - 0.5) * 2))
         if label is not None and rv >= 0.98 and self.xfade >= 1.0:
             draw_label_pill(cr, self.dock.font, label[0], label[1], label[2], width)
         elif self.opening and self.search is None and g["pe"] < 0.3 and g["s"] > 0.8:
